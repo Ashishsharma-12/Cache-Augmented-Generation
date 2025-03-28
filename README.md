@@ -1,29 +1,51 @@
-# KV Cache Augmented Generation
+# Cache-Augmented Generation (CAG)
 
-This project demonstrates Key-Value (KV) Cache Augmented Generation for improving the performance of text generation with large language models. It provides a Streamlit-based UI to interact with local LLMs through Ollama, with the ability to reuse KV caches between generations and augment prompts with knowledge from uploaded documents.
+A complete implementation of Cache-Augmented Generation, a technique for faster LLM inference by preloading knowledge into KV cache. This project provides a Streamlit-based UI that supports both HuggingFace and Ollama models.
 
 ## Features
 
-- **KV Cache Reuse**: Reuse key-value pairs from previous generations to speed up inference
-- **Prefix Matching**: Leverage partial caches when the new prompt starts with a cached prompt
-- **Knowledge Base**: Upload documents to provide context for text generation
+- **Cache-Augmented Generation**: Preload knowledge into KV cache for faster inference
+- **HuggingFace Integration**: Direct KV cache manipulation with HuggingFace transformers models
+- **Ollama Support**: Use locally running Ollama models for inference
+- **Knowledge Base**: Upload and process documents for knowledge augmentation
 - **Document Search**: Find relevant document chunks to augment prompts
-- **Benchmarking**: Compare generation performance with and without KV cache
-- **Streamlit UI**: User-friendly interface for interacting with models
-- **Ollama Integration**: Works with locally-run models via Ollama
+- **CAG Benchmarking**: Compare standard generation vs. CAG for performance metrics
+- **Streamlit UI**: User-friendly interface for all features
+
+## What is CAG?
+
+Cache-Augmented Generation (CAG) is a technique that enhances language model inference by preloading knowledge directly into the model's key-value (KV) cache, rather than including it in each prompt. Unlike RAG (Retrieval-Augmented Generation), which embeds and retrieves knowledge through vector similarity, CAG directly leverages the model's internal caching mechanism.
+
+### CAG vs. RAG
+
+**Retrieval-Augmented Generation (RAG)**:
+1. Stores knowledge as vectors in a database
+2. Converts queries to vectors to find similar knowledge
+3. Includes retrieved knowledge in the prompt
+
+**Cache-Augmented Generation (CAG)**:
+1. Preloads all knowledge directly into the model's KV cache
+2. Keeps processed knowledge in cache between queries
+3. Processes only the query during inference
+
+CAG provides significant speedups by avoiding reprocessing the same knowledge for each query.
 
 ## Prerequisites
 
 - Python 3.8 or higher
-- [Ollama](https://ollama.ai/) installed and running locally
-- Local LLM models (this project was tested with Mistral and DeepSeek-R1)
+- For Ollama backend:
+  - [Ollama](https://ollama.ai/) installed and running locally
+  - Local LLM models (e.g., Mistral and DeepSeek-R1)
+- For HuggingFace backend:
+  - CUDA-compatible GPU recommended
+  - Access to HuggingFace models (e.g., Llama-3.1)
 
 ## Installation
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/yourusername/kv-cache-project.git
-   cd kv-cache-project
+   git clone https://github.com/yourusername/cache-augmented-generation.git
+   cd cache-augmented-generation
    ```
 
 2. Install required Python packages:
@@ -31,7 +53,7 @@ This project demonstrates Key-Value (KV) Cache Augmented Generation for improvin
    pip install -r requirements.txt
    ```
 
-3. Ensure Ollama is installed and running:
+3. For Ollama backend, ensure Ollama is installed and running:
    - Download from [ollama.ai](https://ollama.ai/)
    - Start the Ollama service
    - Pull the models you want to use, e.g.:
@@ -50,73 +72,72 @@ This project demonstrates Key-Value (KV) Cache Augmented Generation for improvin
 2. The application will open in your default web browser at http://localhost:8501
 
 3. Using the interface:
-   - Select a model from the dropdown in the sidebar
-   - Adjust generation parameters as needed
-   - Upload documents in the Knowledge Base tab
-   - Search and use document contexts in the Text Generation tab
-   - Enter a prompt and generate text
-   - Use the Benchmark tab to measure speedup with KV cache
+
+   **Backend Selection**:
+   - Choose between Ollama and HuggingFace
+   - For HuggingFace, load a model by entering its name (e.g., `meta-llama/Meta-Llama-3.1-8B-Instruct`)
+
+   **Knowledge Base Tab**:
+   - Upload documents to create a knowledge base
+   - Documents are automatically split into manageable chunks
+
+   **CAG Preloading Tab**:
+   - Enter or paste knowledge text to preload into the model's KV cache
+   - You can also load documents from your knowledge base
+
+   **Text Generation Tab**:
+   - Enter your prompt
+   - Optionally use knowledge from the knowledge base or preloaded knowledge
+   - Generate text with the selected model
+
+   **Benchmark Tab**:
+   - Compare standard generation with CAG
+   - See speed improvements and output quality
 
 ## How It Works
 
-### KV Cache in Transformer Models
+The implementation includes two approaches to CAG:
 
-In transformer models, generation is done token by token. For each token:
-1. The model computes attention over all previously processed tokens
-2. For each token, the model calculates "key" and "value" vectors for each attention layer
-3. Without caching, these calculations are repeated for every token at each generation step
+**HuggingFace Implementation**:
+- Directly manipulates the transformer model's KV cache
+- Efficiently preloads knowledge text and saves the resulting KV cache
+- Truncates the KV cache after each generation to maintain consistency
 
-KV caching saves these key-value vectors from previous calculations, avoiding redundant computation and significantly speeding up generation.
-
-### Cross-Request KV Cache Augmentation
-
-This project extends KV caching beyond a single generation request:
-
-1. When generating text with a prompt, we save the KV cache to disk
-2. For subsequent requests with the same prompt, we load and reuse this cache
-3. For new prompts that share a prefix with cached prompts, we reuse the relevant portion of the cache
-
-This approach can provide substantial speedups, especially for applications with:
-- Repeated prompts or system instructions
-- Common prefixes in prompts
-- Need for low-latency generation
-
-### Knowledge Base Augmentation
-
-The application also supports knowledge base augmentation:
-
-1. Upload text documents in the Knowledge Base tab
-2. Documents are automatically split into manageable chunks
-3. When generating text, search for relevant information in your documents
-4. Add selected context to your prompt to provide the model with additional information
-
-This allows the model to generate more accurate and contextually relevant responses by incorporating information from your documents.
+**Ollama Implementation**:
+- Uses Ollama's API for local model inference
+- Implements CAG by intelligently caching full prompts and prefix matches
+- Provides similar benefits with models running through Ollama
 
 ## Project Structure
 
 ```
 kv_cache_project/
-├── cache/               # Storage for KV caches
-│   └── docs/            # Processed document chunks
+├── cache/                   # Storage for various caches
+│   ├── docs/                # Processed document chunks
+│   ├── hf_cache/            # HuggingFace KV caches
+│   └── ollama_cache/        # Ollama KV caches
 ├── src/
-│   ├── __init__.py      # Package initialization
-│   ├── kv_cache_manager.py    # Manages KV cache storage and retrieval
-│   ├── ollama_client.py       # Client for interacting with Ollama API
-│   ├── kv_cache_generator.py  # Combines KV cache with generation
-│   ├── document_processor.py  # Processes and manages document chunks
-│   └── streamlit_app.py       # Streamlit UI application
-├── requirements.txt     # Python dependencies
-├── run.py               # Main entry point
-└── README.md            # This file
+│   ├── __init__.py          # Package initialization
+│   ├── kv_cache_manager.py  # Manages KV cache for Ollama
+│   ├── hf_cache_manager.py  # Manages KV cache for HuggingFace
+│   ├── ollama_client.py     # Client for Ollama API
+│   ├── cag_generator.py     # High-level CAG implementation
+│   ├── document_processor.py # Processes documents
+│   └── streamlit_app.py     # Streamlit UI application
+├── requirements.txt         # Python dependencies
+├── run.py                   # Main entry point
+└── README.md                # This file
 ```
 
-## Limitations
+## When to Use CAG
 
-- KV cache format is model-specific and may need adjustments for different models
-- Large caches can consume significant disk space
-- Prefix matching works best with substantial common prefixes
-- Performance gains depend on model architecture and hardware
-- Document search uses simple keyword matching (not semantic search)
+CAG is most effective when:
+- Working with a stable knowledge base
+- Running multiple queries against the same knowledge
+- Optimizing for response time
+- Working with knowledge that fits within the model's context window
+
+For very large knowledge bases that exceed the model's context window, a traditional RAG approach may be more appropriate.
 
 ## License
 
@@ -125,4 +146,5 @@ This project is released under the MIT License. See the LICENSE file for details
 ## Acknowledgments
 
 - [Ollama](https://ollama.ai/) for providing easy access to local LLMs
-- [Streamlit](https://streamlit.io/) for the interactive UI framework 
+- [Streamlit](https://streamlit.io/) for the interactive UI framework
+- The original CAG research paper for the conceptual framework 

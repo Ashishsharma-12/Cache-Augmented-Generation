@@ -6,25 +6,64 @@ import matplotlib.pyplot as plt
 import numpy as np
 from typing import Dict, Any, List, Optional
 import io
+import torch
+from enum import Enum
 
-# Import our modules (assuming they're in the same directory)
-from kv_cache_generator import KVCacheGenerator
+# Import our modules
+from cag_generator import CAGGenerator, ModelBackend
 from ollama_client import OllamaGenerationOptions
 from document_processor import DocumentProcessor
 
+# Optional imports for HuggingFace
+try:
+    from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+    HF_AVAILABLE = True
+except ImportError:
+    HF_AVAILABLE = False
+
 # Set page configuration
 st.set_page_config(
-    page_title="KV Cache Augmented Generation",
+    page_title="Cache Augmented Generation",
     page_icon="⚡",
     layout="wide",
 )
 
-# Initialize session state
-if "kv_generator" not in st.session_state:
-    st.session_state.kv_generator = KVCacheGenerator(
-        cache_dir=os.path.abspath("../cache"),
-        ollama_url="http://localhost:11434",
-    )
+# Initialize session state for backend selection
+if "backend" not in st.session_state:
+    st.session_state.backend = "ollama"  # Default to Ollama
+
+if "hf_model_loaded" not in st.session_state:
+    st.session_state.hf_model_loaded = False
+
+if "hf_model" not in st.session_state:
+    st.session_state.hf_model = None
+
+if "hf_tokenizer" not in st.session_state:
+    st.session_state.hf_tokenizer = None
+
+# Initialize the generator based on the selected backend
+def initialize_generator():
+    if st.session_state.backend == "huggingface":
+        if not st.session_state.hf_model_loaded:
+            st.warning("No HuggingFace model loaded. Please load a model in the settings.")
+            return None
+        
+        return CAGGenerator(
+            backend=ModelBackend.HUGGINGFACE,
+            hf_model=st.session_state.hf_model,
+            hf_tokenizer=st.session_state.hf_tokenizer,
+            cache_dir=os.path.abspath("../cache"),
+        )
+    else:  # ollama
+        return CAGGenerator(
+            backend=ModelBackend.OLLAMA,
+            ollama_url="http://localhost:11434",
+            cache_dir=os.path.abspath("../cache"),
+        )
+
+# Initialize other components
+if "generator" not in st.session_state:
+    st.session_state.generator = initialize_generator()
 
 if "doc_processor" not in st.session_state:
     st.session_state.doc_processor = DocumentProcessor(
@@ -40,41 +79,146 @@ if "benchmark_results" not in st.session_state:
 if "selected_documents" not in st.session_state:
     st.session_state.selected_documents = []
 
+if "knowledge_text" not in st.session_state:
+    st.session_state.knowledge_text = None
+
+if "preloaded_knowledge_id" not in st.session_state:
+    st.session_state.preloaded_knowledge_id = None
+
+# Load HuggingFace model function
+def load_huggingface_model(model_name, use_4bit=True):
+    """Load a HuggingFace model."""
+    if not HF_AVAILABLE:
+        st.error("HuggingFace transformers library not available. Please install it with pip install transformers.")
+        return None, None
+    
+    try:
+        with st.spinner(f"Loading {model_name}... This might take a while."):
+            # Configure quantization if requested
+            if use_4bit:
+                quantization_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32
+                )
+            else:
+                quantization_config = None
+            
+            # Load tokenizer and model
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                quantization_config=quantization_config,
+                device_map="auto"
+            )
+            
+            return model, tokenizer
+    except Exception as e:
+        st.error(f"Error loading model: {str(e)}")
+        return None, None
+
 # App title and description
-st.title("⚡ KV Cache Augmented Generation")
+st.title("⚡ Cache Augmented Generation (CAG)")
 st.markdown(
     """
-    This application demonstrates Key-Value Cache Augmented Generation using Ollama models.
-    It allows you to see the performance benefits of reusing KV caches between generations.
+    This application demonstrates Cache-Augmented Generation using local LLMs.
+    It supports both:
+    - **Ollama models** running locally via API
+    - **HuggingFace models** loaded directly in Python (requires GPU)
     
-    **Models available:** Mistral and DeepSeek-R1 (loaded locally via Ollama)
+    CAG preloads knowledge into the model's KV cache, resulting in significant speedups for queries about that knowledge.
     """
 )
 
 # Sidebar for configurations
 with st.sidebar:
-    # Cache settings
+    st.header("Backend Settings")
+    # Backend selection
+    backend_options = ["ollama"]
+    if HF_AVAILABLE:
+        backend_options.append("huggingface")
+    
+    selected_backend = st.selectbox(
+        "Backend", 
+        options=backend_options,
+        index=0 if st.session_state.backend == "ollama" else 1
+    )
+    
+    # Update backend if changed
+    if selected_backend != st.session_state.backend:
+        st.session_state.backend = selected_backend
+        st.session_state.generator = initialize_generator()
+        st.experimental_rerun()
+    
+    # HuggingFace-specific settings
+    if selected_backend == "huggingface":
+        st.subheader("HuggingFace Settings")
+        
+        hf_model_name = st.text_input(
+            "Model Name", 
+            value="meta-llama/Meta-Llama-3.1-8B-Instruct" if not st.session_state.hf_model_loaded else "",
+            placeholder="E.g., meta-llama/Meta-Llama-3.1-8B-Instruct"
+        )
+        
+        use_4bit = st.checkbox("Load in 4-bit", value=True)
+        
+        if st.button("Load Model") and hf_model_name:
+            model, tokenizer = load_huggingface_model(hf_model_name, use_4bit)
+            
+            if model is not None and tokenizer is not None:
+                st.session_state.hf_model = model
+                st.session_state.hf_tokenizer = tokenizer
+                st.session_state.hf_model_loaded = True
+                st.session_state.generator = initialize_generator()
+                st.success(f"Model {hf_model_name} loaded successfully!")
+            else:
+                st.error("Failed to load model.")
+    
+    # Ollama-specific settings
+    if selected_backend == "ollama":
+        st.subheader("Ollama Settings")
+        ollama_url = st.text_input("Ollama URL", value="http://localhost:11434")
+        
+        if ollama_url != "http://localhost:11434" and st.button("Update Ollama URL"):
+            st.session_state.generator = CAGGenerator(
+                backend=ModelBackend.OLLAMA,
+                ollama_url=ollama_url,
+                cache_dir=os.path.abspath("../cache"),
+            )
+            st.success(f"Ollama URL updated to {ollama_url}")
+        # Cache settings
+    st.divider()
     st.header("Cache Settings")
     use_cache = st.checkbox("Use KV Cache", value=True)
     save_cache = st.checkbox("Save KV Cache", value=True)
-        
+    
     if st.button("Clear Cache"):
-        st.session_state.kv_generator.cache_manager.clear_cache()
+        if selected_backend == "ollama":
+            st.session_state.generator.kv_cache_manager.clear_cache()
         st.success("Cache cleared successfully!")
-        
-    # Model settings
+    # Model selection (for both backends)
     st.divider()
     st.header("Model Settings")
     
     # Get available models
     try:
-        available_models = st.session_state.kv_generator.list_available_models()
-        if not available_models:
-            available_models = ["mistral", "deepseek-r1"]  # Fallback options
+        if st.session_state.generator:
+            available_models = st.session_state.generator.list_available_models()
+            if not available_models:
+                if selected_backend == "ollama":
+                    available_models = ["mistral", "deepseek-r1"]  # Fallback options for Ollama
+                else:
+                    available_models = ["No models available"]
+        else:
+            available_models = ["No backend initialized"]
     except Exception as e:
-        st.error(f"Error connecting to Ollama: {str(e)}")
-        st.error("Make sure Ollama is running on http://localhost:11434")
-        available_models = ["mistral", "deepseek-r1"]  # Fallback options
+        st.error(f"Error connecting to backend: {str(e)}")
+        if selected_backend == "ollama":
+            st.error("Make sure Ollama is running on the specified URL")
+            available_models = ["mistral", "deepseek-r1"]  # Fallback options
+        else:
+            available_models = ["No models available"]
     
     selected_model = st.selectbox("Model", available_models)
     
@@ -82,24 +226,32 @@ with st.sidebar:
     st.header("Generation Parameters")
     
     # Generation parameters
-    temperature = st.slider("Temperature", 0.0, 1.0, 0.5, 0.1)
+    temperature = st.slider("Temperature", 0.0, 2.0, 0.7, 0.1)
     top_p = st.slider("Top P", 0.0, 1.0, 0.9, 0.01)
-    top_k = st.slider("Top K", 1, 100, 50, 1)
-    max_tokens = st.slider("Max Tokens", 32, 4096, 2048, 16)
+    max_tokens = st.slider("Max Tokens", 32, 4096, 1024, 32)
     
 
+
 # Main content area - tabs
-tab1, tab2, tab3, tab4 = st.tabs(["Text Generation", "Knowledge Base", "Benchmark", "About KV Cache"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "Text Generation", "Knowledge Base", "CAG Preloading", "Benchmark", "About CAG"
+])
 
 # Tab 1: Text Generation
 with tab1:
+    # Add context from documents or preloaded knowledge
+    use_knowledge_base = st.checkbox("Use Knowledge Base", value=False)
+    use_preloaded_knowledge = st.checkbox("Use Preloaded Knowledge", value=False)
     # Text input area
     prompt = st.text_area("Enter your prompt", height=150)
     
-    # Add context from documents
-    use_knowledge_base = st.checkbox("Use Knowledge Base", value=False)
+    # Cannot use both
+    if use_knowledge_base and use_preloaded_knowledge:
+        st.warning("Please select only one knowledge source (either Knowledge Base or Preloaded Knowledge).")
     
-    if use_knowledge_base:
+    knowledge_text = None
+    
+    if use_knowledge_base and not use_preloaded_knowledge:
         if not st.session_state.selected_documents:
             st.warning("No documents selected. Please add documents in the Knowledge Base tab.")
         else:
@@ -116,11 +268,17 @@ with tab1:
                         with st.expander(f"Document Chunk (Relevance: {score:.2f})"):
                             st.text(chunk_text)
                             if st.button(f"Use This Context", key=f"use_{chunk_id}"):
-                                current_prompt = prompt if prompt else ""
-                                prompt = f"{current_prompt}\n\nContext:\n{chunk_text}\n\n"
-                                st.experimental_rerun()
+                                knowledge_text = chunk_text
+                                st.success("Context selected!")
                 else:
                     st.info("No relevant information found in knowledge base.")
+    
+    elif use_preloaded_knowledge and not use_knowledge_base:
+        if st.session_state.knowledge_text is None:
+            st.warning("No knowledge has been preloaded. Please preload knowledge in the CAG Preloading tab.")
+        else:
+            knowledge_text = st.session_state.knowledge_text
+            st.success(f"Using preloaded knowledge ({len(knowledge_text)} characters)")
     
     # Create two columns for buttons
     col1, col2 = st.columns(2)
@@ -132,23 +290,18 @@ with tab1:
         clear_clicked = st.button("Clear History")
     
     # Handle generation
-    if generate_clicked and prompt:
+    if generate_clicked and prompt and st.session_state.generator:
         with st.spinner("Generating..."):
-            # Create options
-            options = OllamaGenerationOptions(
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                max_tokens=max_tokens,
-            )
-            
-            # Generate with KV cache
-            result = st.session_state.kv_generator.generate(
+            # Generate with CAG
+            result = st.session_state.generator.generate(
                 prompt=prompt,
-                model=selected_model,
-                options=options,
+                model_name=selected_model,
                 use_cache=use_cache,
                 save_cache=save_cache,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                knowledge_text=knowledge_text
             )
             
             # Add to history
@@ -186,9 +339,14 @@ with tab1:
                         prefix_ratio = prefix_length / len(result["prompt"]) if len(result["prompt"]) > 0 else 0
                         cache_status = f"Prefix cache hit ({prefix_ratio:.1%}) ✅"
                     
+                    knowledge_status = "No knowledge used"
+                    if result.get("knowledge_augmented", False):
+                        knowledge_status = "Knowledge augmented ✅"
+                    
                     st.markdown(f"- **Cache Status:** {cache_status}")
+                    st.markdown(f"- **Knowledge:** {knowledge_status}")
                     st.markdown(f"- **Tokens Generated:** {result.get('tokens_generated', 0)}")
-                    st.markdown(f"- **Generation Time:** {result.get('total_duration', 0):.2f}s")
+                    st.markdown(f"- **Generation Time:** {result.get('generation_time', 0):.2f}s")
                     st.markdown(f"- **Speed:** {result.get('tokens_per_second', 0):.2f} tokens/sec")
                     st.markdown(f"- **Model:** {result.get('model', 'unknown')}")
     else:
@@ -251,7 +409,7 @@ with tab2:
             with col2:
                 if st.button("Remove", key=f"remove_{doc['id']}"):
                     st.session_state.doc_processor.remove_document(doc['id'])
-                    st.experimental_rerun()
+                    st.rerun()
                     
                 if st.button("View Chunks", key=f"view_{doc['id']}"):
                     chunks = st.session_state.doc_processor.get_document_chunks(doc['id'])
@@ -261,47 +419,146 @@ with tab2:
     else:
         st.info("No documents in the knowledge base. Upload a document to get started.")
 
-# Tab 3: Benchmark
+# Tab 3: CAG Preloading
 with tab3:
-    st.header("Benchmark KV Cache Performance")
+    st.header("CAG Knowledge Preloading")
     st.markdown(
         """
-        This benchmark compares generation times with and without KV cache.
-        It runs multiple generations with the same prompt and reports the speedup.
+        Preload knowledge directly into the model's KV cache for faster inference.
+        This is the core of Cache-Augmented Generation (CAG).
+        
+        Enter or paste knowledge text below, then preload it into the model's KV cache.
+        This knowledge will be efficiently reused for all subsequent queries.
+        """
+    )
+    # Information about loading from files
+    st.subheader("Load Knowledge from Knowledge Base")
+    st.markdown(
+        """
+        You can also load knowledge from your knowledge base.
         """
     )
     
-    benchmark_prompt = st.text_area("Benchmark prompt", height=150)
+    if not st.session_state.selected_documents:
+        st.warning("No documents in knowledge base. Please add documents in the Knowledge Base tab.")
+    else:
+        # Create a dropdown of available documents
+        doc_options = [f"{doc['filename']} ({doc['chunks']} chunks)" for doc in st.session_state.selected_documents]
+        selected_doc_idx = st.selectbox("Select Document", range(len(doc_options)), format_func=lambda x: doc_options[x])
+        
+        if st.button("Load Document as Knowledge"):
+            selected_doc = st.session_state.selected_documents[selected_doc_idx]
+            doc_chunks = st.session_state.doc_processor.get_document_chunks(selected_doc["id"])
+            
+            # Combine all chunks into one text
+            combined_text = "\n\n".join(doc_chunks)
+            
+            # Update the knowledge text area
+            st.session_state.knowledge_text = combined_text
+            st.success(f"Loaded document '{selected_doc['filename']}' as knowledge text")
+            st.rerun()
+    # Knowledge text input
+    cag_knowledge = st.text_area(
+        "Knowledge Text", 
+        height=300,
+        value=st.session_state.knowledge_text if st.session_state.knowledge_text else "",
+        placeholder="Enter the knowledge text to preload into the model's KV cache..."
+    )
+    
+    # System prompt (for HuggingFace models)
+    if st.session_state.backend == "huggingface":
+        system_prompt = st.text_area(
+            "System Prompt (optional)",
+            height=100,
+            placeholder="Optional system instructions for the model"
+        )
+    else:
+        system_prompt = None
+    
+    # Preload button
+    if st.button("Preload Knowledge", type="primary") and cag_knowledge:
+        if not st.session_state.generator:
+            st.error("No generator initialized. Please check your backend settings.")
+        else:
+            with st.spinner("Preloading knowledge into KV cache..."):
+                try:
+                    knowledge_id = st.session_state.generator.preload_knowledge(
+                        knowledge=cag_knowledge,
+                        model_name=selected_model,
+                        system_prompt=system_prompt
+                    )
+                    
+                    # Save the knowledge text for later use
+                    st.session_state.knowledge_text = cag_knowledge
+                    st.session_state.preloaded_knowledge_id = knowledge_id
+                    
+                    st.success("Knowledge successfully preloaded into KV cache!")
+                    if knowledge_id:
+                        st.info(f"Knowledge ID: {knowledge_id}")
+                except Exception as e:
+                    st.error(f"Error preloading knowledge: {str(e)}")
+    
+    # Show preloaded knowledge if available
+    if st.session_state.knowledge_text:
+        st.subheader("Currently Preloaded Knowledge")
+        with st.expander("View preloaded knowledge"):
+            st.text(st.session_state.knowledge_text)
+        
+        if st.button("Clear Preloaded Knowledge"):
+            st.session_state.knowledge_text = None
+            st.session_state.preloaded_knowledge_id = None
+            st.success("Preloaded knowledge cleared")
+            st.rerun()
+    
+    
+
+# Tab 4: Benchmark
+with tab4:
+    st.header("Benchmark CAG Performance")
+    st.markdown(
+        """
+        Compare the performance of standard generation vs. CAG (with preloaded knowledge).
+        """
+    )
+    
+    # Knowledge text for benchmark
+    benchmark_knowledge = st.text_area(
+        "Knowledge Text for Benchmark", 
+        height=200,
+        placeholder="Enter knowledge text for the benchmark..."
+    )
+    
+    # Query text
+    benchmark_query = st.text_area(
+        "Query", 
+        height=100,
+        placeholder="Enter a query about the knowledge..."
+    )
     
     col1, col2 = st.columns(2)
     
     with col1:
-        num_runs = st.slider("Number of runs per method", 1, 5, 2)
+        num_runs = st.slider("Number of benchmark runs", 1, 5, 3)
     
     with col2:
-        warm_up = st.checkbox("Do warm-up run", value=True)
+        pass  # Empty column for layout
     
-    if st.button("Run Benchmark", type="primary") and benchmark_prompt:
-        with st.spinner("Running benchmark..."):
-            # Create options
-            options = OllamaGenerationOptions(
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                max_tokens=max_tokens,
-            )
-            
-            # Run benchmark
-            results = st.session_state.kv_generator.benchmark(
-                prompt=benchmark_prompt,
-                model=selected_model,
-                options=options,
-                runs=num_runs,
-                warm_up=warm_up
-            )
-            
-            # Store results
-            st.session_state.benchmark_results = results
+    if st.button("Run CAG Benchmark", type="primary") and benchmark_knowledge and benchmark_query:
+        if not st.session_state.generator:
+            st.error("No generator initialized. Please check your backend settings.")
+        else:
+            with st.spinner("Running benchmark..."):
+                results = st.session_state.generator.benchmark_cag(
+                    query=benchmark_query,
+                    model_name=selected_model,
+                    knowledge_text=benchmark_knowledge,
+                    runs=num_runs,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max_tokens
+                )
+                
+                st.session_state.benchmark_results = results
     
     # Display benchmark results
     if st.session_state.benchmark_results:
@@ -312,21 +569,14 @@ with tab3:
         
         # Create comparison table
         data = {
-            "Method": ["No Cache", "With Full Cache", "With Prefix Cache*"],
+            "Method": ["Standard (Knowledge in Prompt)", "CAG (Preloaded Knowledge)"],
             "Avg. Time (s)": [
-                results.get("no_cache_avg_time", 0),
-                results.get("cache_avg_time", 0),
-                results.get("prefix_cache_avg_time", 0) if "prefix_cache_avg_time" in results else "-"
-            ],
-            "Avg. Speed (tokens/s)": [
-                results.get("no_cache_avg_tps", 0),
-                results.get("cache_avg_tps", 0),
-                results.get("prefix_cache_avg_tps", 0) if "prefix_cache_avg_tps" in results else "-"
+                results.get("standard_avg_time", 0),
+                results.get("cag_avg_time", 0)
             ],
             "Speedup": [
                 "1.00x (baseline)",
-                f"{results.get('cache_speedup', 1):.2f}x",
-                f"{results.get('prefix_cache_speedup', 1):.2f}x" if "prefix_cache_speedup" in results else "-"
+                f"{results.get('speedup', 1):.2f}x"
             ]
         }
         
@@ -337,16 +587,12 @@ with tab3:
         # Create bar chart for speedup
         fig, ax = plt.subplots(figsize=(10, 6))
         
-        methods = ["No Cache", "Full Cache"]
-        speedups = [1.0, results.get("cache_speedup", 1)]
+        methods = ["Standard", "CAG"]
+        speedups = [1.0, results.get("speedup", 1)]
         
-        if "prefix_cache_speedup" in results:
-            methods.append("Prefix Cache")
-            speedups.append(results.get("prefix_cache_speedup", 1))
-        
-        ax.bar(methods, speedups, color=['blue', 'green', 'orange'][:len(methods)])
+        ax.bar(methods, speedups, color=['blue', 'green'])
         ax.set_ylabel('Speedup Factor')
-        ax.set_title('Generation Speedup with KV Cache')
+        ax.set_title('Generation Speedup with CAG')
         ax.axhline(y=1, color='r', linestyle='-', alpha=0.3)
         ax.grid(axis='y', linestyle='--', alpha=0.7)
         
@@ -355,61 +601,78 @@ with tab3:
         
         st.pyplot(fig)
         
-        st.caption("* Prefix Cache only shown if benchmark included prefix testing")
+        # Display example output
+        st.subheader("Example Outputs")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**Standard Approach Output:**")
+            if results["standard_approach"]:
+                st.text(results["standard_approach"][0]["text"])
+        
+        with col2:
+            st.markdown("**CAG Approach Output:**")
+            if results["cag_approach"]:
+                st.text(results["cag_approach"][0]["text"])
     else:
-        st.info("Enter a prompt and click 'Run Benchmark' to start!")
+        st.info("Enter knowledge and a query, then click 'Run CAG Benchmark' to start!")
 
-# Tab 4: Info about KV Cache
-with tab4:
-    st.header("About KV Cache Augmented Generation")
+# Tab 5: About CAG
+with tab5:
+    st.header("About Cache-Augmented Generation (CAG)")
     
     st.markdown(
         """
-        ### What is KV Cache?
+        ### What is Cache-Augmented Generation?
 
-        In transformer-based language models, the **Key-Value (KV) Cache** is a performance optimization technique. 
-        When generating text, the model needs to compute attention over all tokens it has processed. 
-        Without caching, the model would need to recompute the key and value projections for all previous tokens at each generation step.
-
-        The KV cache stores these key and value projections for all processed tokens, so they don't need to be recomputed, making generation much faster.
-
-        ### What is KV Cache Augmentation?
-
-        KV Cache Augmentation extends this concept between separate generation requests:
-
-        1. When you generate text with a prompt, the system saves the KV cache
-        2. If you generate text with the same prompt again, the saved KV cache is reused
-        3. If you generate text with a prompt that has a common prefix with a cached prompt, the system can reuse part of the cached KV state
+        Cache-Augmented Generation (CAG) is a technique for enhancing language model inference by preloading
+        knowledge directly into the model's key-value (KV) cache, rather than including it in the prompt.
         
-        This approach can provide significant speedups, especially for applications that:
-        - Process similar prompts repeatedly
-        - Have standard prefixes (like system prompts) that are reused across different queries
-        - Need to optimize for low latency
+        ### CAG vs RAG (Retrieval-Augmented Generation)
         
-        ### Knowledge Base Augmentation
-
-        This application also demonstrates knowledge base augmentation:
-
-        1. Upload text documents to create a knowledge base
-        2. Documents are split into chunks for easier processing
-        3. When generating text, you can search the knowledge base for relevant context
-        4. The context is added to your prompt, providing the model with additional information
+        **Retrieval-Augmented Generation (RAG)** works by:
+        1. Storing knowledge as vectors in a database
+        2. Converting the query to a vector and finding similar knowledge vectors
+        3. Including retrieved knowledge in the prompt
         
-        This approach allows the model to generate more accurate and informed responses based on your documents.
+        **Cache-Augmented Generation (CAG)** works by:
+        1. Preloading all knowledge directly into the model's KV cache
+        2. Keeping this processed knowledge in the cache between queries
+        3. Processing only the query during inference
         
-        ### Benefits Demonstrated in this App
+        ### Key Benefits of CAG
         
-        This application shows:
+        - **Speed**: Much faster inference by avoiding reprocessing the knowledge
+        - **Simplicity**: No vector database or embedding model needed
+        - **Efficiency**: Directly leverages the model's internal mechanism
         
-        1. **Full Cache Match**: When the exact prompt is reused, showing the maximum possible speedup
-        2. **Prefix Cache Match**: When a prompt starts with a cached prompt, demonstrating partial KV reuse
-        3. **No Cache**: Baseline performance without KV cache reuse
-        4. **Knowledge Base Integration**: Using document context to enhance generation quality
+        ### How This Implementation Works
         
-        The benchmark tab quantifies these benefits precisely with your specific hardware and chosen model.
+        This application supports two approaches to CAG:
+        
+        **HuggingFace Implementation**:
+        - Directly manipulates the transformer model's KV cache
+        - Efficiently preloads knowledge text and saves the resulting KV cache
+        - Truncates the KV cache after each generation to maintain consistency
+        
+        **Ollama Implementation**:
+        - Uses Ollama's API for local model inference
+        - Implements CAG by intelligently caching full prompts and prefix matches
+        - Provides similar benefits with models running through Ollama
+        
+        ### When to Use CAG
+        
+        CAG is most effective when:
+        - Working with a stable knowledge base
+        - Running multiple queries against the same knowledge
+        - Optimizing for response time
+        - Working with knowledge that fits within the model's context window
+        
+        For very large knowledge bases that exceed the model's context window, a traditional RAG approach may be more appropriate.
         """
     )
 
 # Footer
 st.divider()
-st.caption("KV Cache Augmented Generation | Using Ollama and local models") 
+st.caption("Cache-Augmented Generation | KV Cache-Based Knowledge Integration for LLMs") 

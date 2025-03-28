@@ -3,4 +3,9 @@ requests==2.31.0
 transformers==4.38.2
 numpy==1.26.4
 python-dotenv==1.0.1
-pydantic==2.6.3 
+pydantic==2.6.3
+torch>=2.0.0
+bitsandbytes>=0.45.0
+accelerate>=0.26.0
+matplotlib>=3.7.0
+pandas>=2.0.0 
